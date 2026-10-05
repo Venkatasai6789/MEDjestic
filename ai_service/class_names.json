@@ -1,13 +1,121 @@
 {
-  "0": "Body Tissue or Organ",
-  "1": "Glass Equipment",
-  "2": "Metal Equipment",
-  "3": "Plastic Equipment",
-  "4": "Paper Equipment",
-  "5": "Syringe Needles",
-  "6": "Gauze",
-  "7": "Gloves",
-  "8": "Masks",
-  "9": "Syringes",
-  "10": "Tweezers"
+  "version": "1.0.0",
+  "description": "MEDjestic Medical Waste Classification - Authoritative class mapping. Adapted from ViT-B/16 trained on Pharmaceutical and Biomedical Waste dataset. .DS_Store (index 7 in original) removed as invalid filesystem artifact.",
+  "num_classes": 12,
+  "classes": [
+    "Body Tissue or Organ",
+    "Glass Equipment",
+    "Metal Equipment",
+    "Organic Waste",
+    "Plastic Equipment",
+    "Paper Equipment",
+    "Syringe Needles",
+    "Gauze",
+    "Gloves",
+    "Masks",
+    "Syringes",
+    "Tweezers"
+  ],
+  "original_dataset_mapping": {
+    "0": "(BT) Body Tissue or Organ",
+    "1": "(GE) Glass equipment-packaging 551",
+    "2": "(ME) Metal equipment -packaging",
+    "3": "(OW) Organic wastes",
+    "4": "(PE) Plastic equipment-packaging",
+    "5": "(PP) Paper equipment-packaging",
+    "6": "(SN) Syringe needles",
+    "7": ".DS_Store [REMOVED - filesystem artifact, not a valid class]",
+    "8": "Gauze",
+    "9": "Gloves",
+    "10": "Mask",
+    "11": "Syringe",
+    "12": "Tweezers"
+  },
+  "index_remapping_note": "Original model has 13 classes with .DS_Store at index 7. We keep the original 13-class model but skip index 7 during post-processing. Model output index 7 is treated as Unknown/Invalid.",
+  "waste_metadata": {
+    "Body Tissue or Organ": {
+      "category": "Biohazard Waste",
+      "riskLevel": "Critical",
+      "disposalMethod": "High-Temperature Incineration",
+      "colorBin": "Yellow Category",
+      "hazardIndex": 98
+    },
+    "Glass Equipment": {
+      "category": "Sharps Waste",
+      "riskLevel": "High",
+      "disposalMethod": "Secure Containment & Autoclaving",
+      "colorBin": "Yellow Category",
+      "hazardIndex": 75
+    },
+    "Metal Equipment": {
+      "category": "Sharps Waste",
+      "riskLevel": "High",
+      "disposalMethod": "Autoclaving & Secure Containment",
+      "colorBin": "Yellow Category",
+      "hazardIndex": 80
+    },
+    "Organic Waste": {
+      "category": "Biohazard Waste",
+      "riskLevel": "High",
+      "disposalMethod": "Incineration",
+      "colorBin": "Yellow Category",
+      "hazardIndex": 70
+    },
+    "Plastic Equipment": {
+      "category": "Recyclable Waste",
+      "riskLevel": "Low",
+      "disposalMethod": "Decontaminate & Polymer Recycling",
+      "colorBin": "Blue Category",
+      "hazardIndex": 18
+    },
+    "Paper Equipment": {
+      "category": "Biohazard Waste",
+      "riskLevel": "Medium",
+      "disposalMethod": "Secure Incineration",
+      "colorBin": "Yellow Category",
+      "hazardIndex": 45
+    },
+    "Syringe Needles": {
+      "category": "Sharps Waste",
+      "riskLevel": "Critical",
+      "disposalMethod": "Puncture-Proof Containment & Encapsulation",
+      "colorBin": "Yellow Category",
+      "hazardIndex": 96
+    },
+    "Gauze": {
+      "category": "Biohazard Waste",
+      "riskLevel": "Critical",
+      "disposalMethod": "Autoclaving & Incineration",
+      "colorBin": "Yellow Category",
+      "hazardIndex": 88
+    },
+    "Gloves": {
+      "category": "Infectious Waste",
+      "riskLevel": "Medium",
+      "disposalMethod": "Chemical Disinfection & Incineration",
+      "colorBin": "Red Category",
+      "hazardIndex": 62
+    },
+    "Masks": {
+      "category": "General Waste",
+      "riskLevel": "Low",
+      "disposalMethod": "Controlled Landfill",
+      "colorBin": "Black Category",
+      "hazardIndex": 24
+    },
+    "Syringes": {
+      "category": "Sharps Waste",
+      "riskLevel": "High",
+      "disposalMethod": "Autoclaving & Shredding",
+      "colorBin": "Yellow Category",
+      "hazardIndex": 78
+    },
+    "Tweezers": {
+      "category": "Sharps Waste",
+      "riskLevel": "Medium",
+      "disposalMethod": "Autoclaving & Secure Recycling",
+      "colorBin": "Yellow Category",
+      "hazardIndex": 60
+    }
+  }
 }

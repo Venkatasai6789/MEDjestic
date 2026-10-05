@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+dataset/
+runs/
+verification_outputs/
+*.jpg
+*.png
+*.jpeg
+train.py
+train_classifier.py
+check_classes.py
+test_script.py
+train_output.txt
+.git/
+.gitignore
+README.md

@@ -1,0 +1,6 @@
+[submodule "external/medical-waste-transformer-reference"]
+	path = external/medical-waste-transformer-reference
+	url = https://github.com/Vishnugupta2711/Real-time-medical-waste-segregation-using-transformers-and-edge-AI-solutions.git
+[submodule "model/Medical-Waste-Object-Detection-Using-YOLO"]
+	path = model/Medical-Waste-Object-Detection-Using-YOLO
+	url = https://github.com/manjunathsept11/Medical-Waste-Object-Detection-Using-YOLO.git

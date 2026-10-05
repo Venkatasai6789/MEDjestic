@@ -1,593 +1,313 @@
-import os
-import datetime
-import json
-import numpy as np
-import requests
-import io
-from PIL import Image
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-
-app = Flask(__name__)
-CORS(app)
-
-YOLO_AVAILABLE = False
-
-# The 11 classes the model was trained on (matching actual dataset folders)
-# Ordered to match alphabetical sort of dataset subdirectories:
-OFFICIAL_CLASSES = [
-    'Body Tissue or Organ',  # 0 - (BT) Body Tissue or Organ
-    'Glass Equipment',       # 1 - (GE) Glass equipment-packaging
-    'Metal Equipment',       # 2 - (ME) Metal equipment-packaging
-    'Plastic Equipment',     # 3 - (PE) Plastic equipment-packaging
-    'Paper Equipment',       # 4 - (PP) Paper equipment-packaging
-    'Syringe Needles',       # 5 - (SN) Syringe needles  <-- WAS wrongly called Gloves before fix
-    'Gauze',                 # 6 - Gauze
-    'Gloves',                # 7 - Gloves
-    'Masks',                 # 8 - Mask
-    'Syringes',              # 9 - Syringe
-    'Tweezers'               # 10 - Tweezers
-]
-
-# Map each trained YOLO class name -> compliance category shown in the dashboard
-# The 'class' field in the response is the YOLO detection name (what was identified).
-# The 'category' field is the WHO/CDC compliance waste bin category.
-DETECTION_TO_OFFICIAL_MAP = {
-    'Body Tissue or Organ': 'Biohazard Waste',
-    'Glass Equipment':      'Sharps Waste',
-    'Metal Equipment':      'Sharps Waste',
-    'Plastic Equipment':    'Recyclable Waste',
-    'Paper Equipment':      'Biohazard Waste',
-    'Syringe Needles':      'Sharps Waste',    # (SN) folder -> Syringe Needles item
-    'Gauze':                'Biohazard Waste',
-    'Gloves':               'Infectious Waste',
-    'Masks':                'General Waste',
-    'Syringes':             'Sharps Waste',
-    'Tweezers':             'Sharps Waste'
-}
-
-# Try to load YOLO11
+# Hugging Face ZeroGPU compatibility - MUST be imported before any other module
 try:
-    from ultralytics import YOLO
-    import torch
-    
-    yolo_weights = os.path.join(os.path.dirname(__file__), 'best.pt')
-    loaded_custom = False
-    MODEL_USED_NAME = "YOLO11n"
-    if os.path.exists(yolo_weights):
-        try:
-            # Load custom trained model
-            yolo_model = YOLO(yolo_weights)
-            print(f"[OK] YOLO11 model loaded with custom weights: {yolo_weights}")
-            loaded_custom = True
-            MODEL_USED_NAME = "YOLO11n-Custom"
-        except Exception as load_err:
-            print(f"[WARN] Failed to load custom weights from {yolo_weights}: {load_err}. Falling back to default yolo11n.pt.")
-            
-    if not loaded_custom:
-        # Fallback to pre-trained YOLO11 nano model
-        yolo_model = YOLO("yolo11n.pt")
-        print("[OK] YOLO11 model loaded with default weights (yolo11n.pt).")
-        MODEL_USED_NAME = "YOLO11n"
-    
-    # Configure GPU/CUDA support
-    if torch.cuda.is_available():
-        yolo_model.to('cuda')
-        print("[OK] CUDA acceleration activated for YOLO11.")
-    
-    YOLO_AVAILABLE = True
+    import spaces
+except ImportError:
+    class _MockSpaces:
+        def GPU(self, fn=None, **kwargs):
+            if fn is not None:
+                return fn
+            def decorator(f):
+                return f
+            return decorator
+    spaces = _MockSpaces()
+
+import os
+import sys
+import uuid
+import datetime
+import traceback
+import asyncio
+import io
+import json
+
+import torch
+from fastapi import FastAPI, APIRouter, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import gradio as gr
+from PIL import Image
+
+# Monkeypatch Gradio client schema bug with boolean additionalProperties in Gradio 5.x
+try:
+    import gradio_client.utils
+    _orig_get_type = gradio_client.utils.get_type
+    def _patched_get_type(schema):
+        if isinstance(schema, bool):
+            return "bool"
+        return _orig_get_type(schema)
+    gradio_client.utils.get_type = _patched_get_type
+
+    _orig_json_schema = gradio_client.utils._json_schema_to_python_type
+    def _patched_json_schema(schema, defs=None):
+        if isinstance(schema, bool):
+            return "dict" if schema else "None"
+        return _orig_json_schema(schema, defs)
+    gradio_client.utils._json_schema_to_python_type = _patched_json_schema
+except Exception:
+    pass
+
+# Add current directory to path
+sys.path.insert(0, os.path.dirname(__file__))
+
+from config import (
+    MODEL_FULL_NAME, MODEL_VERSION, MODEL_NAME,
+    HOST, PORT, VALID_CLASSES,
+    CONFIDENCE_THRESHOLD, MARGIN_THRESHOLD
+)
+from model_loader import load_model, is_model_loaded, get_device
+from preprocessing import preprocess_image_bytes, validate_image_bytes
+from inference import run_two_stage_inference
+from postprocessing import build_multi_object_response, draw_multi_object_annotations
+from tracker import ObjectTracker
+from video_processor import create_job, get_job_status, get_job_result
+
+# ZeroGPU probe function
+@spaces.GPU
+def probe_gpu():
+    """Startup probe function for ZeroGPU supervisor detection."""
+    return None
+
+# Load models at startup
+print(f"[STARTUP] Initializing Two-Stage Multi-Object AI System ({MODEL_FULL_NAME})...")
+try:
+    load_model()
+    print("[STARTUP] Models loaded successfully.")
 except Exception as e:
-    print(f"[ERROR] Failed to load YOLO11/Ultralytics: {e}")
+    print(f"[STARTUP] WARNING: Model loading failed: {e}")
+    traceback.print_exc()
 
-# Waste Metadata Database connected to YOLO classes
-WASTE_METADATA = {
-    'Syringes': {
-        'category': 'Sharps Waste',
-        'riskLevel': 'High',
-        'disposalMethod': 'Autoclaving & Shredding',
-        'colorBin': 'Yellow Category',
-        'rec': 'No',
-        'recyclingMethod': 'None',
-        'impact': 'High risk of needle stick injuries and bloodborne pathogens.',
-        'compliance': 'Dispose in puncture-proof containers. Do not recap.'
-    },
-    'Gloves': {
-        'category': 'Infectious Waste',
-        'riskLevel': 'Medium',
-        'disposalMethod': 'Chemical Disinfection & Incineration',
-        'colorBin': 'Red Category',
-        'rec': 'No',
-        'recyclingMethod': 'None',
-        'impact': 'Threat of biological contamination and pathogen transmission.',
-        'compliance': 'Segregate immediately in red biohazard bags.'
-    },
-    'Masks': {
-        'category': 'General Waste',
-        'riskLevel': 'Low',
-        'disposalMethod': 'Landfill / Municipal Waste',
-        'colorBin': 'Black Category',
-        'rec': 'Partial',
-        'recyclingMethod': 'Polypropylene shredding and pelletizing',
-        'impact': 'Landfill accumulation, slow polymer decomposition.',
-        'compliance': 'Place in black bins. Sanitize hands after disposal.'
-    },
-    'Syringe Needles': {
-        'category': 'Sharps Waste',
-        'riskLevel': 'Critical',
-        'disposalMethod': 'Puncture-proof containment followed by Encapsulation',
-        'colorBin': 'Yellow Category',
-        'rec': 'No',
-        'recyclingMethod': 'None',
-        'impact': 'Extreme sharp injury and disease transmission risk.',
-        'compliance': 'Dispose in rigid sharps boxes at point of use. Never recap.'
-    },
-    'Gauze': {
-        'category': 'Biohazard Waste',
-        'riskLevel': 'Critical',
-        'disposalMethod': 'Autoclaving & Incineration',
-        'colorBin': 'Yellow Category',
-        'rec': 'No',
-        'recyclingMethod': 'None',
-        'impact': 'High infection risk from absorbed body fluids and pathogens.',
-        'compliance': 'Seal in yellow biohazard bags immediately after use.'
-    },
-    'Body Tissue or Organ': {
-        'category': 'Biohazard Waste',
-        'riskLevel': 'Critical',
-        'disposalMethod': 'High-Temperature Incineration',
-        'colorBin': 'Yellow Category',
-        'rec': 'No',
-        'recyclingMethod': 'None',
-        'impact': 'Severe pathogenic and viral outbreak risk if improperly contained.',
-        'compliance': 'Double bag in yellow biohazard bags. Incinerate immediately.'
-    },
-    'Glass Equipment': {
-        'category': 'Sharps Waste',
-        'riskLevel': 'High',
-        'disposalMethod': 'Secure Containment & Landfill / Recycling',
-        'colorBin': 'Yellow Category',
-        'rec': 'Partial',
-        'recyclingMethod': 'Decontaminate and send to specialist glass recycler.',
-        'impact': 'Laceration and infection risk from broken glass edges.',
-        'compliance': 'Place in rigid puncture-resistant containers. Label clearly.'
-    },
-    'Metal Equipment': {
-        'category': 'Sharps Waste',
-        'riskLevel': 'High',
-        'disposalMethod': 'Secure Containment followed by Autoclaving',
-        'colorBin': 'Yellow Category',
-        'rec': 'Partial',
-        'recyclingMethod': 'Autoclave sterilization then metal recycling.',
-        'impact': 'Lacerations and bloodborne pathogen cross-infection risk.',
-        'compliance': 'Place in puncture-proof metal sharps bins. Seal when 75% full.'
-    },
-    'Plastic Equipment': {
-        'category': 'Recyclable Waste',
-        'riskLevel': 'Low',
-        'disposalMethod': 'Decontaminate then Shredding & Polymer Recycling',
-        'colorBin': 'Blue Category',
-        'rec': 'Yes',
-        'recyclingMethod': 'Polymer pelletization for non-clinical plastics',
-        'impact': 'Reduces carbon footprint. Saves raw material oil extraction.',
-        'compliance': 'Ensure not contaminated. Sanitize before placing in blue bin.'
-    },
-    'Paper Equipment': {
-        'category': 'Biohazard Waste',
-        'riskLevel': 'Medium',
-        'disposalMethod': 'Secure Incineration',
-        'colorBin': 'Yellow Category',
-        'rec': 'No',
-        'recyclingMethod': 'None',
-        'impact': 'Carries absorbed pharmaceutical or biological agents.',
-        'compliance': 'Bag in yellow containers. Do not mix with municipal waste.'
-    },
-    'Tweezers': {
-        'category': 'Sharps Waste',
-        'riskLevel': 'Medium',
-        'disposalMethod': 'Autoclaving & Secure Burial or Recycling',
-        'colorBin': 'Yellow Category',
-        'rec': 'Partial',
-        'recyclingMethod': 'Sterilize then send to certified metal recycler.',
-        'impact': 'Scratch and laceration risk. Potential pathogen vector.',
-        'compliance': 'Sterilize in autoclave. Dispose in rigid sharps containers.'
-    }
-}
+# Per-session tracker for webcam frames (maintains persistent track_id across frames)
+_webcam_tracker = ObjectTracker(iou_thresh=0.25, max_lost=25, alpha=0.35)
 
-def load_groq_key():
-    try:
-        # Load from server/.env file
-        env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'server', '.env'))
-        if os.path.exists(env_path):
-            with open(env_path, 'r') as f:
-                for line in f:
-                    if 'GROQ_API_KEY' in line:
-                        parts = line.strip().split('=')
-                        if len(parts) >= 2:
-                            return '='.join(parts[1:]).strip()
-    except Exception as e:
-        print(f"[ENV] Failed to read GROQ_API_KEY from server/.env: {e}")
-    return os.environ.get('GROQ_API_KEY')
+# Router for all MEDjestic REST API endpoints
+api_router = APIRouter()
 
-def local_heuristic_classifier(filename):
-    name = filename.lower()
-    
-    # Priority checks
-    if 'needle' in name or '(sn)' in name or 'sharps' in name:
-        return 'Syringe Needles'
-    if 'syringe' in name:
-        # Check if it has needle or not
-        if 'without' in name or 'no_needle' in name or 'noneedle' in name or 'no needle' in name:
-            return 'Syringes'
-        return 'Syringe Needles' # default to needles if syringe is mentioned unless specified
-    if 'tissue' in name or 'organ' in name or 'body' in name or '(bt)' in name:
-        return 'Body Tissue or Organ'
-    if 'glass' in name or '(ge)' in name:
-        return 'Glass Equipment'
-    if 'metal' in name or '(me)' in name:
-        return 'Metal Equipment'
-    if 'plastic' in name or '(pe)' in name:
-        return 'Plastic Equipment'
-    if 'paper' in name or '(pp)' in name:
-        return 'Paper Equipment'
-    if 'gauze' in name:
-        return 'Gauze'
-    if 'glove' in name or 'latex' in name:
-        return 'Gloves'
-    if 'mask' in name or 'ppe' in name:
-        return 'Masks'
-    if 'tweezer' in name:
-        return 'Tweezers'
-    return None
 
-def call_groq_nlp_classifier(filename):
-    groq_key = load_groq_key()
-    if not groq_key:
-        print("[GROQ] No GROQ_API_KEY found. Using heuristic mapping.")
-        return None
-        
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {groq_key}"
-    }
-    
-    prompt = f"""You are an advanced medical waste classification system.
-Given the filename of an uploaded image, classify the item into exactly one of these 11 categories:
-- Body Tissue or Organ
-- Glass Equipment
-- Metal Equipment
-- Plastic Equipment
-- Paper Equipment
-- Syringe Needles
-- Gauze
-- Gloves
-- Masks
-- Syringes
-- Tweezers
-
-Filename: {filename}
-
-Rules:
-1. Return ONLY the exact class name from the list above.
-2. Do NOT add any punctuation, intro, explanation, markdown or extra characters.
-3. Be accurate (e.g. "syringe_without_needle" -> "Syringes", "syringe_with_needle" -> "Syringe Needles", "latex_glove" -> "Gloves", "tissue" -> "Body Tissue or Organ").
-"""
-
-    try:
-        payload = {
-            "model": "llama-3.1-8b-instant",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.0
+@api_router.get("/health")
+async def health():
+    device = str(get_device()) if is_model_loaded() else "unknown"
+    loaded = is_model_loaded()
+    status_code = 200 if loaded else 503
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "healthy" if loaded else "unhealthy",
+            "model_loaded": loaded,
+            "model_version": MODEL_VERSION,
+            "model_name": MODEL_FULL_NAME,
+            "pipeline": "Two-Stage Multi-Object Detection (YOLO) + ViT-B/16 Classification + ByteTrack",
+            "device": device,
+            "timestamp": datetime.datetime.now().isoformat()
         }
-        res = requests.post(url, headers=headers, json=payload, timeout=4)
-        if res.status_code == 200:
-            content = res.json()['choices'][0]['message']['content'].strip()
-            # Clean up the output in case it has quotes or extra characters
-            for cls in OFFICIAL_CLASSES:
-                if cls.lower() in content.lower():
-                    return cls
-    except Exception as e:
-        print(f"[GROQ] API call failed: {e}")
-def detect_by_color_profile(image_bytes):
-    try:
-        img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-        img = img.resize((100, 100))
-        pixels = list(img.getdata())
-        
-        blue_count = 0
-        black_count = 0
-        white_count = 0
-        yellow_count = 0
-        
-        for r, g, b in pixels:
-            # Bright yellow (background in user's testing setup)
-            if r > 180 and g > 150 and b < 95:
-                yellow_count += 1
-            # Blue mask color: B is dominant and has a blue-ish hue
-            elif b > 105 and b > r and b > g - 20:
-                blue_count += 1
-            # Black mask color: very dark
-            elif r < 70 and g < 70 and b < 70:
-                black_count += 1
-            # White latex glove: bright cream/white (R, G, B are all high and close)
-            elif r > 175 and g > 170 and b > 135 and abs(r - g) < 20 and abs(g - b) < 45:
-                white_count += 1
-                
-        print(f"[COLOR-ANALYSIS] yellow={yellow_count}, blue={blue_count}, black={black_count}, white={white_count}")
-        
-        # If we see yellow background, we are in the user's testing environment
-        # Blue mask detection
-        if blue_count > 250:
-            return 'Masks'
-            
-        # Black mask detection
-        if black_count > 1500:
-            return 'Masks'
-            
-        # White glove detection -> Gauze (since user requested latex glove in the photo to be Gauze)
-        if white_count > 1200:
-            return 'Gauze'
-            
-        # Fallback general checks if background yellow is not as prominent
-        if blue_count > 400:
-            return 'Masks'
-        if black_count > 2500:
-            return 'Masks'
-        if white_count > 2500:
-            return 'Gauze'
-            
-    except Exception as e:
-        print(f"[COLOR-ANALYSIS] Error: {e}")
-    return None
+    )
 
-def get_metadata_by_class(class_name):
-    """Look up waste metadata by the YOLO detected class name.
-    Falls back to the nearest match, then to a generic Biohazard entry.
+
+@api_router.get("/model/info")
+async def model_info():
+    if not is_model_loaded():
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    return {
+        "model": MODEL_FULL_NAME,
+        "architecture": "Two-Stage: YOLO Multi-Object Detector + Vision Transformer (ViT-B/16) + ByteTrack",
+        "version": MODEL_VERSION,
+        "type": "multi_object_detection_and_classification",
+        "num_classes": len(VALID_CLASSES),
+        "classes": VALID_CLASSES,
+        "device": str(get_device()),
+        "runtime": "huggingface",
+        "capabilities": {
+            "image_classification": True,
+            "object_detection": True,
+            "bounding_boxes": True,
+            "tracking": True,
+            "video_processing": True
+        },
+        "coordinate_system": "absolute_pixel_coordinates [x1, y1, x2, y2]"
+    }
+
+
+@api_router.post("/predict")
+async def predict(image: UploadFile = File(...)):
+    """Detect and classify multiple medical waste items in an uploaded image.
+    
+    Stage 1 (Detector): YOLO object detector locates all candidate waste objects.
+    Stage 2 (Classifier): Fine-tuned ViT-B/16 classifies each cropped bounding box.
+    Returns full response matching CameraScanner.jsx schema with boundingBoxes,
+    individual detections, per-crop probabilities, and annotated visual.
     """
-    if class_name in WASTE_METADATA:
-        return WASTE_METADATA[class_name]
-    # Try mapping via compliance map
-    official = DETECTION_TO_OFFICIAL_MAP.get(class_name)
-    if official and official in WASTE_METADATA:
-        return WASTE_METADATA[official]
-    # Fuzzy fallback: try partial match
-    for key in WASTE_METADATA:
-        if key.lower() in class_name.lower() or class_name.lower() in key.lower():
-            return WASTE_METADATA[key]
-    # Last resort default
-    return WASTE_METADATA['Body Tissue or Organ']
-
-@app.route('/predict', methods=['POST'])
-def predict():
-    if 'image' not in request.files:
-        return jsonify({'error': 'No image file uploaded'}), 400
-        
-    file = request.files['image']
-    if file.filename == '':
-        return jsonify({'error': 'Empty filename'}), 400
-        
-    if not YOLO_AVAILABLE:
-        return jsonify({'error': 'YOLO11 engine offline'}), 500
-
+    if not is_model_loaded():
+        raise HTTPException(status_code=503, detail="AI model not loaded. Service unavailable.")
+    
+    if not image.filename:
+        raise HTTPException(status_code=400, detail="No image file provided")
+    
+    image_bytes = await image.read()
+    if len(image_bytes) == 0:
+        raise HTTPException(status_code=400, detail="Empty image file")
+    
+    if len(image_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Image too large. Maximum 10MB.")
+    
+    if not validate_image_bytes(image_bytes):
+        raise HTTPException(status_code=400, detail="Invalid image format. Supported: JPG, JPEG, PNG, WebP")
+    
     try:
-        file_bytes = file.read()
-        temp_img_path = None
-        
-        # Color profile classifier override (webcam or upload)
-        color_class = detect_by_color_profile(file_bytes)
-        if color_class:
-            print(f"[COLOR-DETECTOR] Overrode detection to '{color_class}' based on color profile.")
-            meta = get_metadata_by_class(color_class)
-            dominant_detection = {
-                'class': color_class,
-                'confidence': 0.98,
-                'box': [100, 80, 540, 400],
-                'trackId': 1,
-                'category': meta['category'],
-                'riskLevel': meta['riskLevel'],
-                'colorBin': meta['colorBin'],
-                'weight': 0.22 if color_class == 'Gauze' else 0.08
-            }
-            detections = [dominant_detection]
-            results = []
-        else:
-            # Save temp file for YOLO inference
-            temp_img_path = os.path.join(os.path.dirname(__file__), "temp_yolo_input.jpg")
-            with open(temp_img_path, "wb") as f:
-                f.write(file_bytes)
-            
-            # Run YOLO11 inference with ByteTrack enabled for object tracking
-            use_half = torch.cuda.is_available()
-            results = yolo_model.track(
-                source=temp_img_path,
-                persist=True,
-                tracker="bytetrack.yaml",
-                conf=0.25,
-                half=use_half
-            )
-            
-            detections = []
-        for r in results:
-            boxes = r.boxes
-            if boxes is not None:
-                for box in boxes:
-                    coords = box.xyxy[0].tolist()
-                    cls_id = int(box.cls[0].item())
-                    confidence = float(box.conf[0].item())
-                    
-                    # Track ID from ByteTrack
-                    track_id = int(box.id[0].item()) if box.id is not None else None
-                    
-                    yolo_cls_name = r.names[cls_id]
-                    # Map clean predicted name to official category class
-                    matched_class = DETECTION_TO_OFFICIAL_MAP.get(yolo_cls_name)
-                    if not matched_class:
-                        for key in OFFICIAL_CLASSES:
-                            if key.lower() in yolo_cls_name.lower():
-                                matched_class = key
-                                break
-                    if not matched_class:
-                        matched_class = OFFICIAL_CLASSES[cls_id % len(OFFICIAL_CLASSES)]
-                    
-                    meta = get_metadata_by_class(yolo_cls_name)
-                    
-                    # Calculate simulated weight based on size box ratio
-                    box_w = coords[2] - coords[0]
-                    box_h = coords[3] - coords[1]
-                    area_ratio = min(max((box_w * box_h) / (640 * 480), 0.05), 1.0)
-                    weight = round(area_ratio * (1.5 if matched_class in ['Plastic Bottles', 'Blood Bags'] else 0.25), 2)
-                    
-                    detections.append({
-                        'class': yolo_cls_name,
-                        'confidence': round(confidence, 2),
-                        'box': [int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3])],
-                        'trackId': track_id,
-                        'category': meta['category'],
-                        'riskLevel': meta['riskLevel'],
-                        'colorBin': meta['colorBin'],
-                        'weight': weight
-                    })
-
-        # Standardized Response Format for both yolo11 detections list & root params compatibility
-        dominant_detection = None
-        is_webcam = (file.filename == 'webcam_snap.jpg')
-
-        # Filter out low-confidence detections (especially on webcam/live camera to prevent false positives)
-        # We enforce a 0.60 confidence threshold for live camera feed, and 0.20 for uploaded files.
-        min_conf = 0.60 if is_webcam else 0.20
-        confident_detections = [d for d in detections if d['confidence'] >= min_conf]
-
-        if confident_detections:
-            dominant_detection = max(confident_detections, key=lambda d: d['confidence'])
-
-        # If it is an uploaded file and either YOLO found nothing or confidence is low,
-        # we trigger the secret NLP classification on the filename.
-        if not is_webcam and (not dominant_detection or dominant_detection['confidence'] < 0.65):
-            print(f"[NLP-CORRECTION] Low-confidence detection for '{file.filename}'. Triggering secret NLP classifier.")
-            
-            # Step 1: Check local heuristic keyword matching
-            nlp_class = local_heuristic_classifier(file.filename)
-            
-            # Step 2: Fallback to Groq Llama 3
-            if not nlp_class:
-                nlp_class = call_groq_nlp_classifier(file.filename)
-                
-            if nlp_class:
-                print(f"[NLP-CORRECTION] Secret NLP classifier resolved '{file.filename}' to '{nlp_class}'")
-                meta = get_metadata_by_class(nlp_class)
-                
-                # Mock a successful detection
-                dominant_detection = {
-                    'class': nlp_class,
-                    'confidence': 0.95,
-                    'box': [100, 80, 540, 400],
-                    'trackId': 1,
-                    'category': meta['category'],
-                    'riskLevel': meta['riskLevel'],
-                    'colorBin': meta['colorBin'],
-                    'weight': 0.15
-                }
-                # Force replace detections list
-                detections = [dominant_detection]
-
-        boundingBoxes = []
-        for d in detections:
-            # Only include detections matching our filter or NLP override
-            if d['confidence'] >= min_conf or d == dominant_detection:
-                boundingBoxes.append({
-                    'label': d['class'],
-                    'confidence': d['confidence'],
-                    'box': d['box'],
-                    'trackId': d.get('trackId')
-                })
-
-        if dominant_detection:
-            identified_name = dominant_detection['class']
-            meta = get_metadata_by_class(identified_name)
-            response = {
-                'detectedType': identified_name,
-                'category': meta['category'],
-                'confidence': dominant_detection['confidence'],
-                'riskLevel': meta['riskLevel'],
-                'disposalMethod': meta['disposalMethod'],
-                'colorBin': meta['colorBin'],
-                'recyclable': meta['rec'],
-                'recyclingMethod': meta['recyclingMethod'],
-                'impact': meta['impact'],
-                'compliance': meta['compliance'],
-                'boundingBoxes': boundingBoxes,
-                'weight': dominant_detection['weight'],
-                'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'modelUsed': 'YOLO11n-Custom-Enhanced' if dominant_detection.get('trackId') == 1 and not is_webcam else MODEL_USED_NAME,
-                'detections': detections
-            }
-        else:
-            response = {
-                'detectedType': 'None',
-                'category': 'None',
-                'confidence': 0.0,
-                'riskLevel': 'Low',
-                'disposalMethod': 'None',
-                'colorBin': 'None',
-                'recyclable': 'No',
-                'recyclingMethod': 'None',
-                'impact': 'None',
-                'compliance': 'None',
-                'boundingBoxes': [],
-                'weight': 0.0,
-                'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'modelUsed': MODEL_USED_NAME,
-                'detections': []
-            }
-            
-        return jsonify(response)
+        _, _, img_bgr = preprocess_image_bytes(image_bytes)
+        detections, runtime, fallback_reason = await asyncio.to_thread(run_two_stage_inference, img_bgr)
+        response = build_multi_object_response(detections, img_bgr, source="image", runtime=runtime, fallback_reason=fallback_reason)
+        response['request_id'] = str(uuid.uuid4())
+        response['source'] = 'image'
+        return response
     except Exception as e:
-        return jsonify({'error': f'AI Service error: {str(e)}'}), 500
-    finally:
-        # Cleanup temp file
-        if 'temp_img_path' in locals() and os.path.exists(temp_img_path):
-            os.remove(temp_img_path)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
 
-@app.route('/status', methods=['GET'])
-def status():
-    yolo_w = os.path.join(os.path.dirname(__file__), 'best.pt')
-    return jsonify({
-        'status': 'OK',
-        'yoloAvailable': YOLO_AVAILABLE,
-        'yoloWeightsLoaded': os.path.exists(yolo_w),
-        'device': 'GPU' if torch.cuda.is_available() else 'CPU',
-        'classesTracked': OFFICIAL_CLASSES,
-        'backendService': 'Flask Advanced YOLO11 object detection microservice'
-    })
 
-import threading
-
-def run_auto_train():
+@api_router.post("/predict/frame")
+async def predict_frame(image: UploadFile = File(...)):
+    """Classify a webcam frame with ByteTrack persistent multi-object tracking.
+    
+    Maintains stable track_id across consecutive frames and applies
+    EMA probability smoothing to eliminate label flickering.
+    """
+    if not is_model_loaded():
+        raise HTTPException(status_code=503, detail="AI model not loaded. Service unavailable.")
+    
+    image_bytes = await image.read()
+    if len(image_bytes) == 0:
+        raise HTTPException(status_code=400, detail="Empty frame")
+    
+    if not validate_image_bytes(image_bytes):
+        raise HTTPException(status_code=400, detail="Invalid image format")
+    
     try:
-        import train
-        print("[AUTO-TRAIN] Starting background custom YOLO11 model training...")
-        
-        class Args:
-            data_dir = '/kaggle/input/pharmaceutical-and-biomedical-waste/'
-            epochs = 100
-            batch_size = 16
-            lr = 0.001
-            output_model = os.path.join(os.path.dirname(__file__), 'best.pt')
-            
-        train.main_with_args(Args())
-        print("[AUTO-TRAIN] Background training completed successfully!")
+        _, _, img_bgr = preprocess_image_bytes(image_bytes)
+        detections, runtime, fallback_reason = await asyncio.to_thread(run_two_stage_inference, img_bgr, _webcam_tracker)
+        response = build_multi_object_response(detections, img_bgr, source="webcam", runtime=runtime, fallback_reason=fallback_reason)
+        response['request_id'] = str(uuid.uuid4())
+        response['source'] = 'webcam'
+        response['stabilized'] = True
+        return response
     except Exception as e:
-        print(f"[AUTO-TRAIN] Background training failed or skipped: {str(e)}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Frame inference error: {str(e)}")
 
-def check_and_trigger_training():
-    yolo_w = os.path.join(os.path.dirname(__file__), 'best.pt')
-    # Automatically train if best.pt does not exist
-    if not os.path.exists(yolo_w):
-        threading.Thread(target=run_auto_train, daemon=True).start()
-        print("[AUTO-TRAIN] Triggered background auto-training thread.")
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5001))
-    print(f"[START] Starting Flask AI Microservice on port {port}...")
-    check_and_trigger_training()
-    app.run(host='0.0.0.0', port=port, debug=False)
+@api_router.post("/video/upload")
+async def video_upload(video: UploadFile = File(...)):
+    """Upload a video for asynchronous frame-by-frame two-stage detection & tracking."""
+    if not is_model_loaded():
+        raise HTTPException(status_code=503, detail="AI model not loaded.")
+    
+    if not video.filename:
+        raise HTTPException(status_code=400, detail="No video file provided")
+    
+    allowed_ext = {'.mp4', '.mov', '.webm', '.avi', '.mkv'}
+    ext = os.path.splitext(video.filename)[1].lower()
+    if ext not in allowed_ext:
+        raise HTTPException(status_code=400, detail=f"Unsupported video format. Allowed: {', '.join(allowed_ext)}")
+    
+    video_bytes = await video.read()
+    if len(video_bytes) == 0:
+        raise HTTPException(status_code=400, detail="Empty video file")
+    
+    if len(video_bytes) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Video too large. Maximum 50MB.")
+    
+    job_id = create_job(video_bytes, video.filename)
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "message": "Video processing started with Two-Stage Multi-Object Tracker"
+    }
+
+
+@api_router.get("/video/{job_id}/status")
+async def video_status(job_id: str):
+    status = get_job_status(job_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return status
+
+
+@api_router.get("/video/{job_id}/result")
+async def video_result(job_id: str):
+    status = get_job_status(job_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if status['status'] != 'completed':
+        return {"status": status['status'], "progress": status['progress'], "message": "Processing not yet complete"}
+    
+    result = get_job_result(job_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Result not found")
+    return result
+
+
+# ============================================
+# Gradio Blocks UI (for ZeroGPU supervisor & Web UI)
+# ============================================
+
+with gr.Blocks(title="MEDjestic Multi-Object Waste AI") as demo:
+    gr.Markdown("# 🏥 MEDjestic Two-Stage Multi-Object Waste Detection & Tracking")
+    gr.Markdown("Two-Stage Architecture: **YOLO Detector** + **ViT-B/16 Classifier** + **ByteTrack Tracking**.")
+    with gr.Row():
+        with gr.Column():
+            input_img = gr.Image(type="pil", label="Upload Medical Waste Photograph")
+            btn = gr.Button("Scan & Detect Specimen", variant="primary")
+        with gr.Column():
+            output_annotated = gr.Image(type="pil", label="AI Traced Bounding Boxes")
+            output_label = gr.Label(label="Primary Specimen Probabilities")
+            output_json = gr.Code(language="json", label="Structured Detections API Schema")
+    
+    def gradio_predict(img):
+        if img is None:
+            return None, None, json.dumps({"error": "No image provided"})
+        try:
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG")
+            img_bytes = buf.getvalue()
+            
+            _, _, img_bgr = preprocess_image_bytes(img_bytes)
+            dets, runtime, fallback_reason = run_two_stage_inference(img_bgr)
+            
+            resp = build_multi_object_response(dets, img_bgr, source="gradio", runtime=runtime, fallback_reason=fallback_reason)
+            annotated_bgr = draw_multi_object_annotations(img_bgr, dets)
+            import cv2
+            annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+            pil_annotated = Image.fromarray(annotated_rgb)
+            primary_probs = resp.get('all_probabilities', {})
+            return pil_annotated, primary_probs, json.dumps(resp, indent=2)
+        except Exception as e:
+            traceback.print_exc()
+            return None, {"Error": 1.0}, json.dumps({"error": str(e)}, indent=2)
+
+    btn.click(gradio_predict, inputs=[input_img], outputs=[output_annotated, output_label, output_json], api_name="predict")
+
+# FastAPI Application for standalone ASGI deployment
+fastapi_app = FastAPI(title="MEDjestic AI Service", version=MODEL_VERSION)
+fastapi_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+fastapi_app.include_router(api_router)
+
+# Mount Gradio app on FastAPI for ASGI mode
+app = gr.mount_gradio_app(fastapi_app, demo, path="/ui")
+
+if __name__ == "__main__":
+    # When launched directly by Hugging Face Spaces runtime via `python app.py`
+    demo.queue(default_concurrency_limit=10)
+    app_instance, local_url, _ = demo.launch(
+        server_name="0.0.0.0",
+        server_port=PORT,
+        ssr_mode=False,
+        prevent_thread_lock=True
+    )
+    # Insert API routes at front of router
+    for r in reversed(api_router.routes):
+        app_instance.router.routes.insert(0, r)
+    demo.block_thread()

@@ -33,5 +33,12 @@ dist-ssr
 *.pt
 *.pth
 
+# Python & YOLO caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.cache
+
+
 
 

@@ -29,6 +29,19 @@ const App = () => {
     return localStorage.getItem('theme') === 'dark';
   });
 
+  // Sidebar Collapse State
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => {
+    return localStorage.getItem('sidebar_collapsed') === 'true';
+  });
+
+  const toggleSidebarCollapse = () => {
+    setIsSidebarCollapsed(prev => {
+      const next = !prev;
+      localStorage.setItem('sidebar_collapsed', String(next));
+      return next;
+    });
+  };
+
   useEffect(() => {
     if (isDarkMode) {
       document.documentElement.classList.add('dark');
@@ -462,10 +475,12 @@ const App = () => {
         onLogout={handleLogout} 
         onEditProfile={handleOpenEditProfile}
         isDarkMode={isDarkMode}
+        isCollapsed={isSidebarCollapsed}
+        onToggleCollapse={toggleSidebarCollapse}
       />
 
       {/* Main Body */}
-      <div className="flex-1 ml-72 flex flex-col min-h-screen">
+      <div className={`flex-1 ${isSidebarCollapsed ? 'ml-20' : 'ml-72'} flex flex-col min-h-screen transition-all duration-300 ease-in-out`}>
         <Navbar 
           pageTitle={activeTab} 
           notifications={notifications} 
@@ -474,7 +489,7 @@ const App = () => {
           onToggleTheme={() => setIsDarkMode(prev => !prev)}
         />
         
-        <main className="flex-1 p-8 overflow-y-auto max-w-[1600px] mx-auto w-full">
+        <main className="flex-1 p-6 lg:p-8 overflow-y-auto max-w-[1680px] mx-auto w-full transition-all duration-300">
           {renderActiveView()}
         </main>
       </div>
